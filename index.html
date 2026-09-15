@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ot-forge · 最优传输 / Sinkhorn</title>
+<style>
+  :root{ --bg:#f7f8fa; --card:#fff; --ink:#1f2430; --mut:#6b7280; --line:#e3e6ec;
+         --acc:#2563eb; --acc2:#0891b2; --ok:#16a34a; --bad:#dc2626; --warn:#d97706; }
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.5 system-ui,"Segoe UI",Roboto,"Microsoft YaHei",sans-serif;
+       background:var(--bg);color:var(--ink);padding:20px}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--mut);margin:0 0 16px;font-size:13px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;max-width:1100px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
+  .card h2{font-size:14px;margin:0 0 10px;color:var(--acc)}
+  canvas{width:100%;height:auto;display:block;background:#fff;border:1px solid var(--line);border-radius:6px}
+  .controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:12px}
+  label{font-size:12px;color:var(--mut)}
+  input[type=range]{width:120px}
+  button{background:var(--acc);color:#fff;border:0;border-radius:7px;padding:7px 14px;font-size:13px;cursor:pointer}
+  button.sec{background:#eef2ff;color:var(--acc)}
+  .stat{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--mut);white-space:pre-wrap;max-height:320px;overflow:auto}
+  .checks{list-style:none;margin:0;padding:0}
+  .checks li{display:flex;align-items:center;gap:8px;padding:3px 0;font-size:13px}
+  .badge{font-weight:700}
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)}
+  .pill{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;background:#eef2ff;color:var(--acc)}
+</style>
+</head>
+<body>
+  <h1>ot-forge · 最优传输 / Sinkhorn 算法</h1>
+  <p class="sub">手写熵正则化最优传输（Cuturi 2013）。Wasserstein 距离、传输计划、1D 闭式交叉验证、log/exp 双域一致性。零依赖单文件。</p>
+
+  <div class="controls">
+    <label>ε 正则 <span id="epsv" class="pill">0.10</span></label>
+    <input id="eps" type="range" min="0.02" max="2" step="0.02" value="0.1">
+    <label>迭代 <span id="itv" class="pill">1000</span></label>
+    <input id="iters" type="range" min="100" max="4000" step="100" value="1000">
+    <label>样本 N <span id="nv" class="pill">30</span></label>
+    <input id="n" type="range" min="10" max="60" step="2" value="30">
+    <button id="run">运行 / 自检验</button>
+    <button id="epsRun" class="sec">扫描 ε 收敛</button>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>传输计划 P（热图，行=源 X，列=目标 Y）</h2>
+      <canvas id="planC" width="360" height="360"></canvas>
+    </div>
+    <div class="card">
+      <h2>源/目标散点 + 传输连线（2D）</h2>
+      <canvas id="scatterC" width="360" height="360"></canvas>
+    </div>
+    <div class="card">
+      <h2>ε → 正则化代价（单调不增于 1/ε）</h2>
+      <canvas id="curveC" width="360" height="240"></canvas>
+    </div>
+    <div class="card">
+      <h2>浏览器内 8 项不变量自检</h2>
+      <ul id="checks" class="checks"></ul>
+      <div id="stat" class="stat" style="margin-top:8px"></div>
+    </div>
+  </div>
+
+<script id="engine">
+(function(){
+  const OT = {};
+
+  // ---- PRNG (deterministic) ----
+  OT.mulberry32 = function(seed){
+    let a = seed>>>0;
+    return function(){
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      let t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  };
+  OT.randn = function(rng){
+    let u=0,v=0;
+    while(u===0) u=rng();
+    while(v===0) v=rng();
+    return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);
+  };
+
+  // logsumexp of an array (subtract max)
+  function lse(vec){
+    let m=-Infinity;
+    for(let i=0;i<vec.length;i++) if(vec[i]>m) m=vec[i];
+    if(!isFinite(m)) return -Infinity;
+    let s=0;
+    for(let i=0;i<vec.length;i++) s+=Math.exp(vec[i]-m);
+    return m+Math.log(s);
+  }
+
+  // cost matrix: squared-euclidean (p=2) or |diff|^p
+  OT.costMatrix = function(X,Y,p){
+    p = p||2;
+    const n=X.length, m=Y.length, d=X[0].length;
+    const C=[];
+    for(let i=0;i<n;i++){
+      const row=new Float64Array(m);
+      for(let j=0;j<m;j++){
+        let s=0;
+        for(let k=0;k<d;k++){ const dd=X[i][k]-Y[j][k]; s+=dd*dd; }
+        row[j] = (p===1)? Math.sqrt(s) : s;
+      }
+      C.push(row);
+    }
+    return C;
+  };
+
+  // exp-domain Sinkhorn (for moderate eps, cross-check vs log-domain)
+  OT.sinkhornExp = function(a,b,C,eps,iters){
+    const n=a.length,m=b.length;
+    const K=[];
+    for(let i=0;i<n;i++){ const r=new Float64Array(m); for(let j=0;j<m;j++) r[j]=Math.exp(-C[i][j]/eps); K.push(r); }
+    let u=new Float64Array(n).fill(1), v=new Float64Array(m).fill(1);
+    for(let it=0;it<iters;it++){
+      for(let j=0;j<m;j++){ let s=0; for(let i=0;i<n;i++) s+=K[i][j]*u[i]; v[j]=b[j]/(s+1e-300); }
+      for(let i=0;i<n;i++){ let s=0; for(let j=0;j<m;j++) s+=K[i][j]*v[j]; u[i]=a[i]/(s+1e-300); }
+    }
+    const P=[];
+    for(let i=0;i<n;i++){ const r=new Float64Array(m); for(let j=0;j<m;j++) r[j]=u[i]*K[i][j]*v[j]; P.push(r); }
+    return P;
+  };
+
+  // log-domain Sinkhorn (numerically stable, primary)
+  OT.sinkhorn = function(a,b,C,eps,iters){
+    const n=a.length,m=b.length;
+    const logK=[];
+    for(let i=0;i<n;i++){ const r=new Float64Array(m); for(let j=0;j<m;j++) r[j]=-C[i][j]/eps; logK.push(r); }
+    const loga=[],logb=[];
+    for(let i=0;i<n;i++) loga.push(Math.log(a[i]+1e-300));
+    for(let j=0;j<m;j++) logb.push(Math.log(b[j]+1e-300));
+    let f=new Float64Array(n), g=new Float64Array(m);
+    for(let it=0;it<iters;it++){
+      for(let j=0;j<m;j++){ const t=new Array(n); for(let i=0;i<n;i++) t[i]=logK[i][j]+f[i]; g[j]=logb[j]-lse(t); }
+      for(let i=0;i<n;i++){ const t=new Array(m); for(let j=0;j<m;j++) t[j]=logK[i][j]+g[j]; f[i]=loga[i]-lse(t); }
+    }
+    const P=[];
+    for(let i=0;i<n;i++){ const r=new Float64Array(m); for(let j=0;j<m;j++) r[j]=Math.exp(logK[i][j]+f[i]+g[j]); P.push(r); }
+    return P;
+  };
+
+  OT.wasserstein = function(P,C){
+    let s=0;
+    for(let i=0;i<P.length;i++) for(let j=0;j<P[i].length;j++) s+=P[i][j]*C[i][j];
+    return s;
+  };
+  OT.rowSums = function(P){ const n=P.length,m=P[0].length,r=new Float64Array(n);
+    for(let i=0;i<n;i++) for(let j=0;j<m;j++) r[i]+=P[i][j]; return r; };
+  OT.colSums = function(P){ const n=P.length,m=P[0].length,c=new Float64Array(m);
+    for(let i=0;i<n;i++) for(let j=0;j<m;j++) c[j]+=P[i][j]; return c; };
+  OT.total = function(P){ let s=0; for(let i=0;i<P.length;i++) for(let j=0;j<P[i].length;j++) s+=P[i][j]; return s; };
+
+  // 1D closed form: W_p between empirical measures (sorted samples)
+  OT.ot1d = function(A,B,p){
+    const a=A.slice().sort((x,y)=>x-y), b=B.slice().sort((x,y)=>x-y);
+    const n=Math.min(a.length,b.length); let s=0;
+    for(let i=0;i<n;i++){ const d=Math.abs(a[i]-b[i]); s+=(p===1)?d:d*d; }
+    return (p===1)? s : Math.sqrt(s);
+  };
+  // W2^2 closed form = (1/N) * sum (sorted diff)^2  — empirical measure (marginals 1/N)
+  OT.w2sqClosed = function(A,B){
+    const a=A.slice().sort((x,y)=>x-y), b=B.slice().sort((x,y)=>x-y);
+    const n=Math.min(a.length,b.length); let s=0;
+    for(let i=0;i<n;i++){ const d=a[i]-b[i]; s+=d*d; }
+    return s/n;
+  };
+  OT.w1Closed = function(A,B){
+    const a=A.slice().sort((x,y)=>x-y), b=B.slice().sort((x,y)=>x-y);
+    const n=Math.min(a.length,b.length); let s=0;
+    for(let i=0;i<n;i++) s+=Math.abs(a[i]-b[i]);
+    return s/n;
+  };
+
+  // KL(P || a⊗b) >= 0
+  OT.klTransport = function(P,a,b){
+    let s=0; const n=P.length,m=P[0].length;
+    for(let i=0;i<n;i++) for(let j=0;j<m;j++){
+      const pij=P[i][j];
+      if(pij>1e-300){ const q=a[i]*b[j]; if(q>1e-300) s+=pij*Math.log(pij/q); }
+    }
+    return s;
+  };
+
+  // uniform marginals of length n
+  OT.uniform = function(n){ const a=new Float64Array(n); a.fill(1/n); return a; };
+
+  // generate d-dim gaussian samples (mu may be scalar or array of length d)
+  OT.gauss = function(rng,mu,sig,d,N){
+    const X=[];
+    const mk = (k)=> (typeof mu==='number')? mu : mu[k];
+    for(let i=0;i<N;i++){ const v=new Array(d); for(let k=0;k<d;k++) v[k]=mk(k)+sig*OT.randn(rng); X.push(v); }
+    return X;
+  };
+
+  // regularized cost: <P,C> + eps*KL(P||ab)
+  OT.regCost = function(P,C,a,b,eps){ return OT.wasserstein(P,C)+eps*OT.klTransport(P,a,b); };
+
+  globalThis.OT = OT;
+})();
+</script>
+
+<script id="ui">
+if (typeof document === "undefined") return;
+
+(function(){
+  const OT = globalThis.OT;
+  const $ = id => document.getElementById(id);
+  const epsEl=$("eps"), itEl=$("iters"), nEl=$("n");
+  const epsv=$("epsv"), itv=$("itv"), nv=$("nv");
+  [epsEl,itEl,nEl].forEach(e=>e.addEventListener("input",()=>{epsv.textContent=(+epsEl.value).toFixed(2);itv.textContent=itEl.value;nv.textContent=nEl.value;}));
+
+  function heatmap(canvas,P){
+    const n=P.length,m=P[0].length,ctx=canvas.getContext("2d"),W=canvas.width,H=canvas.height;
+    ctx.clearRect(0,0,W,H);
+    let mx=0; for(let i=0;i<n;i++) for(let j=0;j<m;j++) if(P[i][j]>mx) mx=P[i][j];
+    const cw=W/m, ch=H/n;
+    for(let i=0;i<n;i++) for(let j=0;j<m;j++){
+      const t = mx>0 ? P[i][j]/mx : 0;
+      const r=Math.round(255*(1-t)), g=Math.round(255*(1-t)), b=Math.round(255-(180*t));
+      ctx.fillStyle="rgb("+r+","+g+","+b+")";
+      ctx.fillRect(j*cw,i*ch,cw+0.5,ch+0.5);
+    }
+  }
+
+  function scatter(canvas,X,Y,P){
+    const ctx=canvas.getContext("2d"),W=canvas.width,H=canvas.height;
+    ctx.clearRect(0,0,W,H);
+    const all=[]; X.forEach(p=>all.push(p)); Y.forEach(p=>all.push(p));
+    let mnx=1e9,mxx=-1e9,mny=1e9,mxy=-1e9;
+    all.forEach(p=>{mnx=Math.min(mnx,p[0]);mxx=Math.max(mxx,p[0]);mny=Math.min(mny,p[1]);mxy=Math.max(mxy,p[1]);});
+    const pad=0.3, sx=W/(mxx-mnx+pad*2), sy=H/(mxy-mny+pad*2);
+    const px=p=>W/2+(p[0]-(mnx+mxx)/2)*sx;
+    const py=p=>H/2+(p[1]-(mny+mxy)/2)*sy;
+    // transport lines (argmax per source row)
+    for(let i=0;i<X.length;i++){
+      let best=0,bj=0; for(let j=0;j<Y.length;j++) if(P[i][j]>best){best=P[i][j];bj=j;}
+      ctx.strokeStyle="rgba(37,99,235,0.18)"; ctx.beginPath();
+      ctx.moveTo(px(X[i]),py(X[i])); ctx.lineTo(px(Y[bj]),py(Y[bj])); ctx.stroke();
+    }
+    X.forEach(p=>{ctx.fillStyle="#2563eb";ctx.beginPath();ctx.arc(px(p),py(p),3.5,0,7);ctx.fill();});
+    Y.forEach(p=>{ctx.fillStyle="#dc2626";ctx.beginPath();ctx.arc(px(p),py(p),3.5,0,7);ctx.fill();});
+  }
+
+  function curve(canvas,epsArr,costArr){
+    const ctx=canvas.getContext("2d"),W=canvas.width,H=canvas.height;
+    ctx.clearRect(0,0,W,H);
+    let mn=1e9,mx=-1e9; costArr.forEach(c=>{mn=Math.min(mn,c);mx=Math.max(mx,c);});
+    const pad=24;
+    ctx.strokeStyle="#e3e6ec"; ctx.beginPath(); ctx.moveTo(pad,4); ctx.lineTo(pad,H-pad); ctx.lineTo(W-4,H-pad); ctx.stroke();
+    ctx.strokeStyle="#0891b2"; ctx.beginPath();
+    epsArr.forEach((e,i)=>{
+      const x=pad+(W-pad-6)*(i/(epsArr.length-1));
+      const y=H-pad-(H-pad-10)*((costArr[i]-mn)/((mx-mn)||1));
+      i?ctx.lineTo(x,y):ctx.moveTo(x,y);
+    });
+    ctx.stroke();
+    ctx.fillStyle="#6b7280"; ctx.font="11px sans-serif";
+    ctx.fillText("ε→0 : 代价下降",pad+4,14);
+  }
+
+  function runDemo(){
+    const seed=12345, eps=+epsEl.value, iters=+itEl.value, N=+nEl.value;
+    const rng=OT.mulberry32(seed);
+    const X=OT.gauss(rng,[-1.6,0.4],0.45,2,N);
+    const Y=OT.gauss(rng,[1.6,-0.4],0.45,2,N);
+    const a=OT.uniform(N), b=OT.uniform(N);
+    const C=OT.costMatrix(X,Y,2);
+    const P=OT.sinkhorn(a,b,C,eps,iters);
+    heatmap($("planC"),P); scatter($("scatterC"),X,Y,P);
+    const rs=OT.rowSums(P), cs=OT.colSums(P);
+    let rmax=0,cmax=0;
+    for(let i=0;i<N;i++) rmax=Math.max(rmax,Math.abs(rs[i]-a[i]));
+    for(let j=0;j<N;j++) cmax=Math.max(cmax,Math.abs(cs[j]-b[j]));
+    const w2=OT.wasserstein(P,C);
+    $("stat").textContent =
+      "W2^2 = "+w2.toFixed(4)+"\n"+
+      "行和最大偏差 = "+rmax.toExponential(2)+"\n"+
+      "列和最大偏差 = "+cmax.toExponential(2)+"\n"+
+      "KL(P‖ab) = "+OT.klTransport(P,a,b).toExponential(3)+"  (≥0)";
+    return {X,Y,a,b,C,P};
+  }
+
+  function scanEps(){
+    const N=+nEl.value, iters=Math.min(+itEl.value,2000);
+    const rng=OT.mulberry32(777);
+    const X=OT.gauss(rng,[-1.2,0],0.4,2,N);
+    const Y=OT.gauss(rng,[1.2,0],0.4,2,N);
+    const a=OT.uniform(N), b=OT.uniform(N), C=OT.costMatrix(X,Y,2);
+    const epsArr=[], costArr=[];
+    for(let e=2.0;e>=0.02;e-=0.12){ epsArr.push(+e.toFixed(2)); costArr.push(OT.wasserstein(OT.sinkhorn(a,b,C,e,iters),C)); }
+    curve($("curveC"),epsArr,costArr);
+  }
+
+  function selfCheck(){
+    const ul=$("checks"); ul.innerHTML="";
+    const add=(name,ok,detail)=>{
+      const li=document.createElement("li");
+      li.innerHTML='<span class="badge '+(ok?"ok":"bad")+'">'+(ok?"✓":"✗")+'</span><span>'+name+
+        (detail?' <span style="color:#6b7280">'+detail+'</span>':"")+'</span>';
+      ul.appendChild(li); return ok;
+    };
+    const rng=OT.mulberry32(2026);
+    // 1) 1D closed form W2^2 == Sinkhorn
+    const A=OT.gauss(rng,0,1,1,24).map(p=>p[0]);
+    const B=OT.gauss(rng,2.0,1,1,24).map(p=>p[0]);
+    const C1=OT.costMatrix(A.map(x=>[x]),B.map(x=>[x]),2);
+    const a1=OT.uniform(24),b1=OT.uniform(24);
+    const P1=OT.sinkhorn(a1,b1,C1,0.05,3000);
+    const w2s=OT.wasserstein(P1,C1), w2c=OT.w2sqClosed(A,B);
+    add("1D W2² 闭式==Sinkhorn", Math.abs(w2s-w2c)<w2c*0.06, "Δ="+((w2s-w2c)/w2c*100).toFixed(2)+"%");
+    // 2) 1D closed form W1 == Sinkhorn
+    const C1b=OT.costMatrix(A.map(x=>[x]),B.map(x=>[x]),1);
+    const P1b=OT.sinkhorn(a1,b1,C1b,0.05,3000);
+    const w1s=OT.wasserstein(P1b,C1b), w1c=OT.w1Closed(A,B);
+    add("1D W1 闭式==Sinkhorn", Math.abs(w1s-w1c)<w1c*0.06, "Δ="+((w1s-w1c)/w1c*100).toFixed(2)+"%");
+    // 3) marginals satisfy constraints
+    const rs=OT.rowSums(P1), cs=OT.colSums(P1);
+    let rmax=0,cmax=0; for(let i=0;i<24;i++) rmax=Math.max(rmax,Math.abs(rs[i]-a1[i]));
+    for(let j=0;j<24;j++) cmax=Math.max(cmax,Math.abs(cs[j]-b1[j]));
+    add("边际约束 行/列和=a/b", rmax<1e-4 && cmax<1e-4, "maxΔ="+Math.max(rmax,cmax).toExponential(1));
+    // 4) non-negativity of P
+    let neg=false,mn=0; for(let i=0;i<24;i++) for(let j=0;j<24;j++){ if(P1[i][j]<mn) mn=P1[i][j]; if(P1[i][j]<-1e-12) neg=true; }
+    add("P 非负", !neg, "min="+mn.toExponential(1));
+    // 5) KL(P||ab) >= 0
+    const kl=OT.klTransport(P1,a1,b1);
+    add("KL(P‖ab) ≥ 0", kl>-1e-10, "KL="+kl.toExponential(2));
+    // 6) symmetry W(X,Y)==W(Y,X) in 2D
+    const Xg=OT.gauss(rng,[-1,0],0.5,2,16), Yg=OT.gauss(rng,[1,0],0.5,2,16);
+    const ag=OT.uniform(16),bg=OT.uniform(16);
+    const Cxy=OT.costMatrix(Xg,Yg,2), Cyx=OT.costMatrix(Yg,Xg,2);
+    const Pxy=OT.sinkhorn(ag,bg,Cxy,0.2,2000), Pyx=OT.sinkhorn(bg,ag,Cyx,0.2,2000);
+    add("对称 W(X,Y)=W(Y,X)", Math.abs(OT.wasserstein(Pxy,Cxy)-OT.wasserstein(Pyx,Cyx))<1e-9);
+    // 7) determinism (bit identical)
+    const Pa=OT.sinkhorn(ag,bg,Cxy,0.2,1500), Pb=OT.sinkhorn(ag,bg,Cxy,0.2,1500);
+    add("确定性 同种子逐位一致", JSON.stringify(Pa)===JSON.stringify(Pb));
+    // 8) log-domain == exp-domain (bounded cost)
+    const Xs=OT.gauss(rng,[-1],0.5,1,8).map(p=>p), Ys=OT.gauss(rng,[1],0.5,1,8).map(p=>p);
+    const as=OT.uniform(8),bs=OT.uniform(8);
+    const Cs=OT.costMatrix(Xs,Ys,2), eps2=2.0;
+    const Pl=OT.sinkhorn(as,bs,Cs,eps2,2000), Pe=OT.sinkhornExp(as,bs,Cs,eps2,2000);
+    let d=0; for(let i=0;i<8;i++) for(let j=0;j<8;j++) d=Math.max(d,Math.abs(Pl[i][j]-Pe[i][j]));
+    add("log 域==exp 域", d<1e-6, "maxΔ="+d.toExponential(1));
+  }
+
+  $("run").addEventListener("click",()=>{ runDemo(); selfCheck(); });
+  $("epsRun").addEventListener("click",()=>{ scanEps(); });
+  // auto-run once on load
+  runDemo(); selfCheck(); scanEps();
+})();
+</script>
+</body>
+</html>
