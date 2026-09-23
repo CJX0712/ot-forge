@@ -1,5 +1,12 @@
 # ot-forge · 最优传输 / Sinkhorn 算法
 
+<p align="center">
+  <a href="https://github.com/CJX0712/ot-forge/actions/workflows/ci.yml"><img src="https://github.com/CJX0712/ot-forge/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
+  <a href="https://github.com/CJX0712/ot-forge/releases"><img src="https://img.shields.io/github/v/release/CJX0712/ot-forge?sort=semver" alt="release"></a>
+  <a href="https://github.com/CJX0712/ot-forge/blob/main/LICENSE"><img src="https://img.shields.io/github/license/CJX0712/ot-forge" alt="license"></a>
+  <img src="https://img.shields.io/badge/author-%E6%99%A8%E6%98%9F-1f6feb" alt="author">
+</p>
+
 手写熵正则化最优传输（Entropic Optimal Transport，Cuturi 2013）。零依赖单文件 HTML，浏览器内一键自检 + 无头 Node 断言全绿。
 
 ## 这是什么
